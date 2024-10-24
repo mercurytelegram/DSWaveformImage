@@ -130,6 +130,13 @@ private extension WaveformImageDrawer {
         qos: DispatchQoS.QoSClass,
         position: Waveform.Position
     ) async throws -> DSImage {
+        #if os(watchOS)
+        if let image = try? await waveformImage(fromAudioAt: audioAssetURL, with: configuration, renderer: renderer, position: position) {
+            return image
+        } else {
+            throw GenerationError.generic
+        }
+        #else
         let sampleCount = Int(configuration.size.width * configuration.scale)
         let waveformAnalyzer = WaveformAnalyzer()
         let samples = try await waveformAnalyzer.samples(fromAudioAt: audioAssetURL, count: sampleCount, qos: qos)
@@ -140,6 +147,7 @@ private extension WaveformImageDrawer {
         } else {
             throw GenerationError.generic
         }
+        #endif
     }
 
     private func drawBackground(on context: CGContext, with configuration: Waveform.Configuration) {

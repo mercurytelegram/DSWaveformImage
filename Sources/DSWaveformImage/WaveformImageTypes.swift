@@ -1,4 +1,9 @@
 import AVFoundation
+import SwiftUI
+
+#if os(watchOS)
+import WatchKit
+#endif
 
 #if os(macOS)
     import AppKit
@@ -15,7 +20,9 @@ import AVFoundation
     public typealias DSImage = UIImage
     public enum DSScreen {
         public static var scale: CGFloat {
-            #if swift(>=5.9) && os(visionOS)
+            #if os(watchOS)
+            return WKInterfaceDevice.current().screenScale
+            #elseif swift(>=5.9) && os(visionOS)
             return (UIApplication.shared.connectedScenes.first(where: {$0 is UIWindowScene}) as? UIWindowScene)?.traitCollection.displayScale ?? 1
             #else
             return UIScreen.main.scale
@@ -23,6 +30,16 @@ import AVFoundation
         }
     }
 #endif
+
+public extension DSColor {
+    static var accentColor: DSColor {
+        #if os(macOS)
+        return NSColor(Color.accentColor)
+        #else
+        return UIColor(Color.accentColor)
+        #endif
+    }
+}
 
 /**
  Renders the waveformsamples  on the provided `CGContext`.
@@ -114,7 +131,7 @@ public enum Waveform {
             /// Line cap style. Default is `.round`.
             public let lineCap: CGLineCap
 
-            public init(color: DSColor, width: CGFloat = 1, spacing: CGFloat = 5, lineCap: CGLineCap = .round) {
+            public init(color: DSColor = .accentColor, width: CGFloat = 6, spacing: CGFloat = 2, lineCap: CGLineCap = .round) {
                 self.color = color
                 self.width = width
                 self.spacing = spacing
@@ -126,7 +143,7 @@ public enum Waveform {
         case outlined(DSColor, CGFloat)
         case gradient([DSColor])
         case gradientOutlined([DSColor], CGFloat)
-        case striped(StripeConfig)
+        case striped(StripeConfig = .init())
     }
 
     /**

@@ -66,7 +66,7 @@ struct WaveformLiveCanvas_Previews: PreviewProvider {
     }
 
     static var liveConfiguration: Waveform.Configuration = Waveform.Configuration(
-        style: .striped(.init(color: .systemPink, width: 3, spacing: 3))
+        style: .striped(.init(color: .green, width: 3, spacing: 3))
     )
 
     static var previews: some View {

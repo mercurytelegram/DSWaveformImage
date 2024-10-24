@@ -16,6 +16,186 @@ struct WaveformAnalysis {
     let fft: [TempiFFT]?
 }
 
+#if os(watchOS)
+
+/// Calculates the waveform of the initialized asset URL.
+public struct WaveformAnalyzer: Sendable {
+    public enum AnalyzeError: Error { case generic, userError, emptyTracks, readerError(Int) }
+    
+    /// Everything below this noise floor cutoff will be clipped and interpreted as silence. Default is `-50.0`.
+    public var noiseFloorDecibelCutoff: Float = -50.0
+    
+    public init() {}
+    
+    /// Calculates the amplitude envelope of the initialized audio asset URL, downsampled to the required `count` amount of samples.
+    /// - Parameter fromAudioAt: local filesystem URL of the audio file to process.
+    /// - Parameter count: amount of samples to be calculated. Downsamples.
+    /// - Parameter qos: QoS of the DispatchQueue the calculations are performed (and returned) on.
+    public func samples(fromAudioAt audioAssetURL: URL, count: Int, qos: DispatchQoS.QoSClass = .userInitiated) async throws -> [Float] {
+        try await Task(priority: taskPriority(qos: qos)) {
+            let audioAsset = AVURLAsset(url: audioAssetURL, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
+
+            guard let assetTrack = try await audioAsset.loadTracks(withMediaType: .audio).first else {
+                throw AnalyzeError.emptyTracks
+            }
+            
+            return try await waveformSamples(track: assetTrack, for: audioAssetURL, count: count, fftBands: nil).amplitudes
+        }.value
+        
+    }
+}
+
+// MARK: - Private
+
+fileprivate extension WaveformAnalyzer {
+    func waveformSamples(
+        track audioAssetTrack: AVAssetTrack,
+        for url: URL,
+        count requiredNumberOfSamples: Int,
+        fftBands: Int?
+    ) async throws -> WaveformAnalysis {
+        guard requiredNumberOfSamples > 0 else {
+            throw AnalyzeError.userError
+        }
+
+        let totalSamples = try await totalSamples(of: audioAssetTrack)
+        let analysis = extract(totalSamples, downsampledTo: requiredNumberOfSamples, url: url, fftBands: fftBands)
+        
+        return analysis
+    }
+
+    func extract(
+        _ totalSamples: Int,
+        downsampledTo targetSampleCount: Int,
+        url audioUrl: URL,
+        fftBands: Int?
+    ) -> WaveformAnalysis {
+
+        // read upfront to avoid frequent re-calculation (and memory bloat from C-bridging)
+        let samplesPerPixel = max(1, totalSamples / targetSampleCount)
+
+        // Create an audio file for reading
+        let audioFile: AVAudioFile
+        do {
+            audioFile = try AVAudioFile(forReading: audioUrl)
+        } catch {
+            print("Error: Unable to open audio file - \(error)")
+            return WaveformAnalysis(amplitudes: [], fft: nil)
+        }
+        
+        // Create buffer to read audio data
+        guard let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: audioFile.fileFormat.sampleRate, channels: 1, interleaved: false) else {
+            print("Error: Unable to create audio format.")
+            return WaveformAnalysis(amplitudes: [], fft: nil)
+        }
+        
+        // Set the buffer size (depends on how detailed you want your waveform)
+        let frameCapacity = AVAudioFrameCount(audioFile.length)
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCapacity) else {
+            print("Error: Unable to create audio buffer.")
+            return WaveformAnalysis(amplitudes: [], fft: nil)
+        }
+        
+        do {
+            try audioFile.read(into: buffer)
+        } catch {
+            print("Error: Unable to read audio file into buffer - \(error)")
+            return WaveformAnalysis(amplitudes: [], fft: nil)
+        }
+        
+        // Process audio buffer and calculate waveform
+        let amplitudes = processAmplitudes(buffer: buffer, samplesPerPixel: samplesPerPixel)
+        
+        var fft: [TempiFFT]?
+        if let fftBands {
+            let frameCount = AVAudioFrameCount(audioFile.length)
+            let audioFormat = audioFile.processingFormat
+            let sampleRate = Float(audioFormat.sampleRate)
+            fft = processFFT(buffer: buffer, fftBands: fftBands, frameCount: frameCount, sampleRate: sampleRate)
+        }
+        
+        return WaveformAnalysis(amplitudes: normalize(amplitudes), fft: fft)
+
+    }
+
+    /// Gives 0..1 values
+    func normalize(_ samples: [Float]) -> [Float] {
+        guard let maxWave = samples.max()
+        else { return samples }
+        
+        return samples.map { abs(($0 / maxWave) - 1) }
+    }
+    
+    private func processAmplitudes(buffer: AVAudioPCMBuffer, samplesPerPixel: Int) -> [Float] {
+        
+        var amplitudes = [Float]()
+        
+        // Access the float data of channel 0 (mono)
+        guard let channelData = buffer.floatChannelData?[0]
+        else { return [] }
+        
+        // Calculate RMS (Root Mean Square) for small chunks to represent the waveform
+        let numChunks = Int(buffer.frameLength) / samplesPerPixel
+        
+        for i in 0..<numChunks {
+            var sum: Float = 0
+            for j in 0..<samplesPerPixel {
+                let sample = channelData[i * samplesPerPixel + j]
+                sum += sample * sample
+            }
+            let rms = sqrt(sum / Float(samplesPerPixel))
+            amplitudes.append(rms) // Append the RMS value for this chunk
+            
+        }
+        
+        return amplitudes
+    }
+    
+    private func processFFT(buffer: AVAudioPCMBuffer, fftBands: Int, frameCount: AVAudioFrameCount, sampleRate: Float) -> [TempiFFT]? {
+        
+        guard let channelData = buffer.floatChannelData?[0]
+        else { return nil }
+        
+        let fftSize = 4096 // ~100ms at 44.1kHz, rounded to closest pow(2) for FFT
+        var fftArray = [TempiFFT]()
+        
+        let hopSize = fftSize / 2  // Overlap by 50%
+        let totalFrames = Int(frameCount)
+        
+        for startFrame in stride(from: 0, to: totalFrames - fftSize, by: hopSize) {
+            let fft = TempiFFT(withSize: fftSize, sampleRate: sampleRate)
+            
+            // Copy frames for FFT
+            let fftInput = Array(UnsafeBufferPointer(start: channelData + startFrame, count: fftSize))
+            
+            // Perform FFT
+            fft.fftForward(fftInput)
+            
+            // Calculate linear bands
+            fft.calculateLinearBands(minFrequency: 20, maxFrequency: fft.nyquistFrequency, numberOfBands: fftBands)
+            
+            fftArray.append(fft)
+        }
+        
+        return fftArray
+    }
+
+    private func totalSamples(of audioAssetTrack: AVAssetTrack) async throws -> Int {
+        var totalSamples = 0
+        let (descriptions, timeRange) = try await audioAssetTrack.load(.formatDescriptions, .timeRange)
+
+        descriptions.forEach { formatDescription in
+            guard let basicDescription = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription) else { return }
+            let channelCount = Int(basicDescription.pointee.mChannelsPerFrame)
+            let sampleRate = basicDescription.pointee.mSampleRate
+            totalSamples = Int(sampleRate * timeRange.duration.seconds) * channelCount
+        }
+        return totalSamples
+    }
+}
+
+#else
+
 /// Calculates the waveform of the initialized asset URL.
 public struct WaveformAnalyzer: Sendable {
     public enum AnalyzeError: Error { case generic, userError, emptyTracks, readerError(AVAssetReader.Status) }
@@ -237,6 +417,8 @@ fileprivate extension WaveformAnalyzer {
     }
 }
 
+#endif
+
 // MARK: - Configuration
 
 private extension WaveformAnalyzer {
@@ -262,3 +444,4 @@ private extension WaveformAnalyzer {
         }
     }
 }
+
